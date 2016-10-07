@@ -3,7 +3,7 @@
   Listener is part of the VCoS NSF project, and is intended to listen for incoming serial bytes. 
  These bytes indicate which motor(s) should vibrate to provide haptic feedback to the user.
  The current interface is as follows:
- [Orientation (0..100 percent of rotation Theta. Motor 0 is 0 degrees. 8 bit unsigned int.)]
+ [Motor (0..3 or 5). Each number corresponds to a motor, or 5 for all motors. 8 bit unsigned int.)]
  [Intensity (0..100 percent). 8 bit unsigned int.]
  [Duration (1..100 percent of a second) 8-bit unsigned int.]
  These values are sent in binary packets using unsigned integer values, as follows:
@@ -12,21 +12,39 @@
 
  Authors: Greg Link
           Gus Smith <hfs5022@psu.edu>
+          Chris Pratt <cmp6048@psu.edu>
  */
+ 
+// Play with these (INTENSITY_SCALE has minimum of 3)
+#define INTENSITY_SCALE 70
+#define INTENSITY_MIN 25
+#define INTENSITY_MAX 100
 
 // Pin 13 has an LED connected
 int ledpin = 13;
-// MOT0 - 3 MOT1 - 8 MOT2 - 12 MOT3 - 23
+
+// Pin Mapping for IST Glove: MOT0 - 3 MOT1 - 8 MOT2 - 12 MOT3 - 23
 int motorpins[6] = {
-  3,8,12,23,19,14}; // motor driver pins 0 through 5, ideally spaced 60 degrees apart
+  3,8,12,23,19,14 }; // motor driver pins 0 through 5, ideally spaced 60 degrees apart 
+
+/* Pin Mapping for Dev Glove: MOT0 - 3 MOT1 - 8 MOT2 - 12 MOT4 - 19
+int motorpins[6] = {
+    3,8,12,19,23,14 };
+*/
+
 char print_buffer[64];
 float distance_threshold = 40;
+
+uint8_t motor = 7;
+uint8_t intensity = 0;
+word duration = 0;
 
 // the setup routine runs once when you press reset:
 void setup() {
                    
   Serial.begin(9600); // Serial USB is always 12MBit/sec
   Serial.setTimeout(250);
+
   pinMode(ledpin, OUTPUT);     
   for(int i = 0; i < 6; i++){
     pinMode(motorpins[i],OUTPUT);
@@ -40,7 +58,9 @@ void setup() {
   digitalWrite(ledpin, LOW);    // turn the LED off by making the voltage LOW
   delay(500);  // wait for a second
 
-  // TEST used to determine which motors are which
+  digitalWriteAll(LOW);
+  
+// TEST used to determine which motors are which
 //  while(1){
 //    for (int i = 0; i < 4; i++){
 //      digitalWrite(motorpins[i],HIGH);
@@ -58,7 +78,7 @@ void pulseLED(int durationms){
   delay(durationms);               // wait for a second
 }
 
-void p(char *fmt, ... ){
+void p(char const *fmt, ... ){
   char buf[128]; // resulting string limited to 128 chars
   va_list args;
   va_start (args, fmt );
@@ -67,14 +87,9 @@ void p(char *fmt, ... ){
   Serial.print(buf);
 }
 
-uint8_t theta = 0;
-uint8_t intensity = 0;
-int8_t duration = 0;
-
 void check_bytes(void)
 {
-  static int8_t received_packet [5] = {
-    0,0,0          }; //array for the getc
+  static int8_t received_packet[5] = {0,0,0}; //array for the getc
   static int8_t bytes_seen = 0;
   static bool seenFF = false;
   int8_t num_characters = 5;
@@ -83,9 +98,9 @@ void check_bytes(void)
   while(Serial.available() > 0){  
     
     uint8_t byte = Serial.read();
+
     //p("R:[%d]@%d\n",byte, bytes_seen);
     if(byte == 0xFF) { // preamble byte
-       
       // This happens at the start of a set of numbers, so we prepare to take in a new data set. 
       bytes_seen = 0;
       seenFF = true;
@@ -97,9 +112,6 @@ void check_bytes(void)
     }
     // If we found the full number of bytes expected.
     if(seenFF && bytes_seen == num_characters) {
-      
-      
-      
       // Generate the checksum to check that our data is correct.
       int checksum_int = (int) received_packet[0] + (int) received_packet[1] + (int) received_packet[2] + (int) received_packet[3];
       uint8_t checksum = checksum_int & 0xFF;
@@ -111,15 +123,20 @@ void check_bytes(void)
       
       
       if(/*checksum == received_packet[4]*/1==1){
-        theta = constrain(received_packet[1],0,100);
+        motor = constrain(received_packet[1],0,5);
+        
         intensity = constrain(received_packet[2],0,100);
+        // Scale the intensity to fit between INTENSITY_MIN and INTENSITY_MAX
+        intensity = map(intensity, 0, 100, INTENSITY_MIN, INTENSITY_MAX);
+        
         duration = constrain(received_packet[3],1,100);
-        p("PR: [%d][%d][%d][%d][%d]\n",received_packet[0], received_packet[1], received_packet[2], received_packet[3], received_packet[4]);
+        // Convert 1/100 of a second into ms, then to us
+        duration *= 10 * 1000;
         
-        
+        p("PR: [%d][%d][%d][%d][%d]\n", received_packet[0], received_packet[1], received_packet[2], received_packet[3], received_packet[4]);
       } 
       else {
-        p("ERR: [%d][%d][%d][%d][%d]\n",received_packet[0], received_packet[1], received_packet[2], received_packet[3], received_packet[4]);
+        p("ERR: [%d][%d][%d][%d][%d]\n", received_packet[0], received_packet[1], received_packet[2], received_packet[3], received_packet[4]);
       }
       bytes_seen = 0;
       seenFF = false;
@@ -130,62 +147,85 @@ void check_bytes(void)
   } 
 }
 
+// Write to every motor
+void digitalWriteAll(uint8_t state)
+{
+  for (int m = 0; m < 5; m++)
+  {
+    digitalWriteFast(motorpins[m], state);
+  }
+}
+
+// Run motors with individual PWM
+void runMotors(uint8_t motor, int intensity, word duration)
+{
+  unsigned long start_time = micros();
+  
+  // Calculate length of the duty cycle
+  word cycle_time = INTENSITY_SCALE * intensity;
+
+  // Keep running until the full duration has passed
+  while(start_time + duration > micros()) { 
+    // Pulse the motors based on our duty cycle
+    if(motor == 5) {
+      digitalWriteAll(HIGH);
+    }
+    else {
+      digitalWriteFast(motor, HIGH);
+    }
+    delayMicroseconds(cycle_time);
+
+    // If there's another byte waiting, read it right away
+    if(Serial.available() > 0) {
+      break;
+    }
+
+    // Pulse the motors based on our duty cycle
+    if(motor == 5) {
+      digitalWriteAll(LOW);
+    }
+    else {
+      digitalWriteFast(motor, LOW);
+    }
+
+    // This algorithm breaks up the delays into chunks to keep checking
+    // for the right time to stop the loop.
+    // The shorter our delay, the less we have to break up the delays
+    int iterations = map(intensity, INTENSITY_MIN, INTENSITY_MAX, 
+                         INTENSITY_MIN, INTENSITY_MAX * 2);
+    for(uint8_t i = 0; i < iterations; i++)
+    {
+      delayMicroseconds(((100 * INTENSITY_SCALE) - cycle_time) / iterations);
+      
+      if(start_time + duration < micros()) {
+        break;
+      }
+    }
+
+    // If the above breaks, just use this:
+    // delayMicroseconds(((100 * INTENSITY_SCALE) - cycle_time));
+  }
+}
+
 // the loop routine runs over and over again forever:
 void loop() {
-  
-  theta = 0;
+  motor = 7;
   intensity = 0;
   duration = 0;
   
   check_bytes(); // scan USB incoming buffer for more bytes. If a complete packet, update the three variables and continue.
   pulseLED(10);
-  static float motor_power[6]; // array for percentile power to each motor. Calculated from Theta, then scaled by intensity. For now, a simple range check.
-  float target_period_ms = 1000;
-  float high_period_ms = target_period_ms * intensity/100.0f;
-  
-  float min_dist_from_angle = (100.0f/4.0f)/2.0f;
-  
-  // For each motor...
-  for(int m = 0; m < 6; m++){
-    // Write a note about this later. basically we need the motors assigned to up, down, left, right, and
-    //    not quad 1, 2, 3, 4.
-    float current_angle = m * (100.0f/4.0f);
-    
-    float dist = abs(current_angle - theta);
-        
-    if ( m == theta || theta == 5/*dist < min_dist_from_angle || (current_angle==0 && abs(100-theta) < min_dist_from_angle) */ ) {
-      digitalWrite(motorpins[m], HIGH);
-    } else {
-      digitalWrite(motorpins[m], LOW);
-    }
-    
-   
-  }
 
-  int high_ms = (int)high_period_ms;
-  delay(high_ms);
-  for(int m = 0; m < 4; m++){
-    digitalWrite(motorpins[m],LOW); 
-  }
+  // Run the motors
+  if (motor != 7) {
+    // Set the proper motor based on the motor pins
+    motor = (motor != 5 ? motorpins[motor] : 5);
   
-  int low_ms = (int)target_period_ms - high_ms;
-  //delay(low_ms);
-  if(duration > 0){
-   duration = (int16_t) duration - (int16_t)(low_ms + high_ms)*10; 
+    runMotors(motor, intensity, duration);
+  }
+  // Make sure our motors are off if there are no bytes waiting
+  if(!(Serial.available() > 0))
+  {
+    digitalWriteAll(LOW);
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
